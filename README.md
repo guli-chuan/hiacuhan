@@ -196,20 +196,19 @@ export MYSQL_PASSWORD=你的密码
 export REDIS_HOST=127.0.0.1
 export REDIS_PASSWORD=你的Redis密码     # 无密码可留空
 
-mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=18081
+mvn spring-boot:run
 ```
 
 也可以直接用参数覆盖，不改环境变量：
 
 ```bash
 mvn spring-boot:run -Dspring-boot.run.arguments="\
-  --server.port=18081 \
   --spring.datasource.password=xxx \
   --spring.redis.host=192.168.1.10 \
   --spring.redis.password=xxx"
 ```
 
-> 默认端口 8081，若本机被占用用 `--server.port=18081`。
+> **端口**：默认 **8081**（`application.yml` 里 `${SERVER_PORT:8081}`，可用环境变量 `SERVER_PORT` 覆盖）。只有 8081 被占用时才需要加 `--server.port=18081` 这类参数，启动后访问 `http://localhost:8081`。
 
 启动时 `VoucherOrderServiceImpl.initStock()` 会把 DB 里的秒杀券库存和时间窗同步进 Redis（库存用 `SETNX`，不覆盖运行中的值）。
 
