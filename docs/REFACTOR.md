@@ -102,9 +102,23 @@
 
 ---
 
+## 10. 消费线程优雅停机
+
+| 项 | 内容 |
+| --- | --- |
+| **原版问题** | 消费线程是 `while(true)` 包在 `static ExecutorService` 里，既不随容器关闭，也拿不到停止信号。点停止后 Spring 正常销毁 `LettuceConnectionFactory`，但线程还活着继续 `read`，于是抛 `IllegalStateException: LettuceConnectionFactory was destroyed and cannot be used anymore`；`catch` 里又调 `handlePendingList()` 重试，再炸一次，连续 5 次后回到 `while(true)` 继续炸。结果是**日志无限刷 + JVM 因非守护线程不退出**，只能强杀进程。 |
+| **我的做法** | ① `static` 线程池改实例字段，生命周期跟容器走，线程显式命名 `seckill-consumer-1`；② 加 `volatile boolean running`，`while (running)` 替代 `while(true)`；③ `@PreDestroy` 中 `running = false` → `shutdown()` → `awaitTermination(5s)` → 超时才 `shutdownNow()`；④ `catch` 分支先判 `running`，关闭期间的读异常记 INFO 直接退出，不再打 ERROR；⑤ `handlePendingList()` 的循环同样受 `running` 控制。 |
+| **为什么不用守护线程** | 设成 daemon 能让 JVM 立刻退出、日志也"干净"，但线程是在任意位置被硬杀的：若此刻正在扣库存/写订单，事务被粗暴中断，会留下"库存扣了、订单没落库"的脏数据。显式停机才能保证在途消息处理完再走。 |
+| **时序为什么安全** | `@PreDestroy` 早于依赖 bean 的销毁执行，所以停止过程里读 Redis 仍然合法；等 `destroy()` 返回后 `LettuceConnectionFactory` 才会被销毁。 |
+| **消息不丢** | 5s 内没处理完的消息留在 Stream 的 pending 列表，下次启动由 `handlePendingList()` 捞起重试——这正是第 2 节那套 pending 兜底机制的价值。 |
+| **实测证据** | `ctx.close()` 后：主线程 18.906s 置标志 → 消费线程 20.185s 自然退出（阻塞读 `block(2s)` 走完即退）→ 20.186s 确认优雅退出，**容器关闭总耗时 1715ms**，全程无任何 `LettuceConnectionFactory` 相关 ERROR，`seckill-consumer-1` 状态为终止。 |
+
+---
+
 ## 已知限制（面试被问到可以直接说，不要硬圆）
 
 1. **Stream 消息仍可能重复消费**：没有做消费幂等表，靠 `voucher_order` 表上的唯一索引（用户+券）兜底。
 2. **逻辑过期没有做全量预热任务**：只在应用启动时按需加载，冷启动后第一批请求会走互斥加载。
 3. **没有压测数据**：所有"提升""更快"的说法在这份代码里都没有量化依据。
-4. **单机部署**：Redis 锁是手写 `SETNX + Lua 解锁`，没有用 Redisson 的看门狗续期，长事务场景下锁会提前释放。
+4. **单机部署**：多实例下的时钟漂移、缓存重建竞争只是设计上规避了，没有实测过。
+5. **两处锁机制不统一**：秒杀下单锁用 Redisson `RLock`（`tryLock(10s)` 不传 leaseTime，走看门狗自动续期）；缓存重建锁仍是手写 `SETNX + Lua 解锁`，**没有续期**，靠重建耗时短（毫秒级）来规避锁提前释放的风险。真要统一，应该把重建锁也换成 Redisson。

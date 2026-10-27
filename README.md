@@ -3,7 +3,7 @@
 > 基于 Spring Boot + Redis 的本地生活类应用：商户浏览、探店笔记、点赞关注、优惠券秒杀。
 > Redis 在这里不只是缓存——分布式锁、消息队列、地理位置、签到位图、榜单 ZSet 都跑在它上面。
 
-**这个仓库是我的个人实践**：基础业务代码来自「黑马点评」课程，我在此基础上针对**缓存一致性、消息可靠性、并发原子性**做了 7 处工程化改造。每处改造都写了「原版哪里会出错 → 我怎么改 → 为什么这么改」，见 [docs/REFACTOR.md](docs/REFACTOR.md)。
+**这个仓库是我的个人实践**：基础业务代码来自「黑马点评」课程，我在此基础上针对**缓存一致性、消息可靠性、并发原子性、优雅停机**做了 8 处工程化改造。每处改造都写了「原版哪里会出错 → 我怎么改 → 为什么这么改」，见 [docs/REFACTOR.md](docs/REFACTOR.md)。
 
 我不想把课程原版的功能说成自己写的。**哪些是我写的、哪些不是，文档里分得很清。**
 
@@ -128,6 +128,16 @@ end
 
 原版先 `ZSCORE` 判断再 `ZADD`/`ZREM`，两步之间不是原子的。改成一个脚本内判断 + 增删，返回值直`-1`/`1` 表示取消赞/点赞。
 
+### 8. 消费线程优雅停机
+
+原版消费线程是 `while(true)` + `static ExecutorService`，容器关闭后线程不受 Spring 管理、也没人通知它停，会继续读 Redis。而 `LettuceConnectionFactory` 已经 `destroy`，于是抛 `IllegalStateException: LettuceConnectionFactory was destroyed and cannot be used anymore`，`catch` 里重试又被销毁的连接炸一次，**无限刷日志、JVM 因非守护线程不退**，只能强杀进程。
+
+改法：`volatile boolean running` + `@PreDestroy` 里 `running = false` → `shutdown()` → `awaitTermination(5s)` → 超时才 `shutdownNow()`；循环条件与 `catch` 分支都判 `running`，关闭期间的读异常静默退出而不打 ERROR。线程池从 `static` 改实例字段，生命周期跟容器走。
+
+不设守护线程是刻意的：守护线程在 JVM 退出瞬间被硬杀，若正在扣库存/写订单，事务会被粗暴中断，留下"库存扣了、订单没有"的脏数据。未处理完的消息留在 Stream pending 列表，下次启动由 `handlePendingList()` 捞起重试。
+
+**实测**：`ctx.close()` 后消费线程在 1.3s 内自然退出，容器关闭总耗时 **1715ms**，全程无一条 `LettuceConnectionFactory` 相关 ERROR。
+
 ---
 
 ## 秒杀流程
@@ -232,7 +242,7 @@ src/main/resources/
 1. **Stream 没有消费幂等表**：靠 `voucher_order` 表上的唯一索引（用户 + 券）兜底，重复消息会被索引挡掉，但没有统一的消息去重。
 2. **逻辑过期没有全量预热任务**：只在启动时按需加载，冷启动后第一批请求会走互斥加载。
 3. **没有压测数据**：代码里所有"更快""提升"都没有量化依据，不做数字承诺。
-4. **锁没用看门狗续期**：手写 `SETNX + Lua 解锁`，长事务场景下锁会提前释放；真要用应该换 Redisson 的 `RLock`。
+4. **两处锁机制不统一**：秒杀下单锁用 Redisson `RLock`（不传 leaseTime，走看门狗续期）；缓存重建锁仍是手写 `SETNX + Lua 解锁`，没有续期，靠重建耗时短规避风险。
 5. **单机部署验证**：多实例下的时钟漂移、缓存重建竞争只是设计上规避了，没有实测过。
 
 ---

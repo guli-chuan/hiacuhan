@@ -28,6 +28,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import java.time.Duration;
 import java.time.ZoneId;
 import java.util.Collections;
@@ -70,8 +71,24 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_SCRIPT.setResultType(Long.class);
     }
 
-    /** 单线程消费者，保证同一时刻只有一个线程在处理订单，天然串行 */
-    private static final ExecutorService seckillExecutor = Executors.newSingleThreadExecutor();
+    /**
+     * 单线程消费者，保证同一时刻只有一个线程在处理订单，天然串行。
+     * <p>
+     * 刻意用实例字段而非 static：线程池的生命周期必须跟随 Spring 容器一起结束（见 {@link #destroy()}）。
+     * static 字段不受容器管理，容器销毁后线程仍存活，会去访问已被 destroy 的 Redis 连接工厂，
+     * 报 "LettuceConnectionFactory was destroyed and cannot be used anymore"。
+     * <p>
+     * 也刻意不设成守护线程：守护线程在 JVM 退出瞬间被直接杀掉，
+     * 若此刻正在扣库存/写订单，事务会被粗暴中断，已扣的库存没有对应订单。
+     */
+    private final ExecutorService seckillExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "seckill-consumer-1");
+        t.setDaemon(false);
+        return t;
+    });
+
+    /** 消费者运行标志。容器关闭时置 false，让消费循环尽快自然退出，而不是被强杀 */
+    private volatile boolean running = true;
 
     @PostConstruct
     private void init() {
@@ -82,6 +99,34 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.info("消费者组可能已存在,跳过创建: {}", e.getMessage());
         }
         seckillExecutor.submit(new VoucherOrderHandler());
+    }
+
+    /**
+     * 容器关闭时的优雅停机。
+     * <p>
+     * 时序保证：@PreDestroy 早于依赖 bean 的销毁，所以停止过程中读 Redis 仍然合法；
+     * 等本方法返回后，LettuceConnectionFactory 才会被 destroy。
+     * <p>
+     * 步骤：置标志让循环自然退出 → shutdown 不再接新任务 → 等在途消息处理完（最多 5s）
+     * → 超时才 shutdownNow 兜底。未处理完的消息留在 Stream 的 pending 列表，
+     * 下次启动会被 {@code handlePendingList()} 捞起来重试，不会丢。
+     */
+    @PreDestroy
+    public void destroy() {
+        log.info("秒杀消费者准备关闭，停止接收新消息...");
+        running = false;
+        seckillExecutor.shutdown();
+        try {
+            if (seckillExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                log.info("秒杀消费者已优雅退出");
+            } else {
+                log.warn("秒杀消费者5秒内未退出，强制中断；在途消息留在pending列表，下次启动重试");
+                seckillExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            seckillExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
@@ -151,13 +196,16 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             // 启动时先处理历史遗留的pending消息（修复旧bug留下的"redis已生效但未落库"卡单）
             log.info("秒杀消费者启动，先处理队列中的历史pending消息...");
             handlePendingList();
-            while (true) {
+            while (running) {
                 try {
                     List<MapRecord<String, Object, Object>> orderList = stringRedisTemplate.opsForStream().read(
                             Consumer.from(STREAM_GROUP, STREAM_CONSUMER),
                             StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
                             StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed()));
                     if (orderList == null || orderList.isEmpty()) {
+                        if (!running) {
+                            break;
+                        }
                         // 无新消息时周期兜底处理pending，避免失败消息长期滞留
                         if (System.currentTimeMillis() - lastPendingDrainTime > PENDING_DRAIN_INTERVAL) {
                             lastPendingDrainTime = System.currentTimeMillis();
@@ -167,10 +215,16 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     }
                     processOrder(orderList.get(0));
                 } catch (Exception e) {
+                    // 关闭过程中连接工厂可能已销毁，此时抛异常属于预期，静默退出即可
+                    if (!running) {
+                        log.info("秒杀消费者已停止，忽略关闭期间的一次读异常: {}", e.getMessage());
+                        break;
+                    }
                     log.error("消费秒杀订单消息异常，转入pending重试", e);
                     handlePendingList();
                 }
             }
+            log.info("秒杀消费者线程已退出");
         }
 
         private void processOrder(MapRecord<String, Object, Object> record) throws Exception {
@@ -208,7 +262,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
          */
         private void handlePendingList() {
             int failCount = 0;
-            while (true) {
+            while (running) {
                 try {
                     List<MapRecord<String, Object, Object>> orderList = stringRedisTemplate.opsForStream().read(
                             Consumer.from(STREAM_GROUP, STREAM_CONSUMER),
@@ -220,6 +274,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     processOrder(orderList.get(0));
                     failCount = 0;
                 } catch (Exception e) {
+                    if (!running) {
+                        log.info("秒杀消费者已停止，pending 处理提前结束，剩余消息留待下次启动重试");
+                        break;
+                    }
                     log.error("处理pending消息异常", e);
                     if (++failCount >= 5) {
                         log.error("pending消息连续失败{}次，暂停本次重试，等待下一轮", failCount);
