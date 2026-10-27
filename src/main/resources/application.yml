@@ -22,6 +22,11 @@ spring:
         time-between-eviction-runs: 10s
   jackson:
     default-property-inclusion: non_null # JSON处理时忽略非空字段
+  # 博客图片上传：默认 1MB，手机拍照普遍 2-5MB，不改这里 nginx 放行了也会被 Tomcat 挡掉
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 20MB
 mybatis-plus:
   type-aliases-package: com.hmdp.entity # 别名扫描包
 logging:

@@ -216,6 +216,48 @@ mvn spring-boot:run -Dspring-boot.run.arguments="\
 
 启动时 `VoucherOrderServiceImpl.initStock()` 会把 DB 里的秒杀券库存和时间窗同步进 Redis（库存用 `SETNX`，不覆盖运行中的值）。
 
+### 前端用 nginx 部署
+
+前端是纯静态页，和后端分开部署：nginx 提供静态资源，并把 `/api` 反向代理到 8081。前端 `js/common.js` 里 `axios.defaults.baseURL = "/api"`，所以浏览器全程只跟 nginx 打交道，不存在跨域。
+
+```
+浏览器 → localhost:8080 (nginx)
+           ├─ /             → html/hmdp/*.html
+           ├─ /imgs/**      → 上传的博客图片（也是静态）
+           └─ /api/**       → 剥掉 /api 前缀 → 127.0.0.1:8081
+```
+
+`conf/nginx.conf` 里起作用的是这段：
+
+```nginx
+server {
+    listen 8080;
+    location / {
+        root   html/hmdp;
+        index  index.html;
+    }
+    location /api {
+        client_max_body_size 20m;      # 图片上传，默认才 1MB
+        rewrite /api(/.*) $1 break;    # /api/user/me → /user/me
+        proxy_set_header Host            $host;
+        proxy_set_header X-Real-IP       $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://127.0.0.1:8081;
+    }
+}
+```
+
+**两个会一起踩的上传坑**（只改一个等于没改）：
+
+| 层 | 默认限制 | 不改的后果 | 改哪 |
+|---|---|---|---|
+| nginx | `client_max_body_size 1m` | 直接返回 **413**，请求没进后端 | `nginx.conf` 的 location 内 |
+| Spring Boot | multipart `1MB` | 日志抛 `FileSizeLimitExceededException`，上传失败 | `application.yml` 的 `spring.servlet.multipart` |
+
+手机拍的照片普遍 2-5MB，两处现在都放到 20MB。
+
+**图片存哪**：`SystemConstants.IMAGE_UPLOAD_DIR` 直接指向 nginx 的 `html/hmdp/imgs/`，上传后由 nginx 静态提供，路径形如 `/imgs/blogs/{d1}/{d2}/{uuid}.jpg`。换机器部署只改这个常量，不用另配静态资源映射。
+
 ---
 
 ## 目录结构
