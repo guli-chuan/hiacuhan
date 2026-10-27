@@ -109,7 +109,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * <p>
      * 步骤：置标志让循环自然退出 → shutdown 不再接新任务 → 等在途消息处理完（最多 5s）
      * → 超时才 shutdownNow 兜底。未处理完的消息留在 Stream 的 pending 列表，
-     * 下次启动会被 {@code handlePendingList()} 捞起来重试，不会丢。
+     * 下次启动会被 {@code drainPendingList()} 捞起来重试，不会丢。
      */
     @PreDestroy
     public void destroy() {
@@ -188,28 +188,42 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 成功或业务拒绝（重复下单/库存不足）都ACK；真正的异常不ACK，消息留在pending列表等待重试。
      */
     private class VoucherOrderHandler implements Runnable {
+        /** pending 兜底清理的固定间隔：每 30 秒检查一次 */
+        private static final long PENDING_DRAIN_INTERVAL_MS = 30_000L;
+        /** 单轮 pending 最多处理条数，积压严重时留机会给主消费 */
+        private static final int PENDING_MAX_PER_ROUND = 20;
+        /** Redis 不可用时的退避上限 */
+        private static final long MAX_BACKOFF_MS = 30_000L;
+
         private long lastPendingDrainTime = 0L;
-        private static final long PENDING_DRAIN_INTERVAL = 30000L;
+        /** 连续消费失败次数，用于指数退避与日志降噪 */
+        private int consecutiveFailures = 0;
 
         @Override
         public void run() {
             // 启动时先处理历史遗留的pending消息（修复旧bug留下的"redis已生效但未落库"卡单）
             log.info("秒杀消费者启动，先处理队列中的历史pending消息...");
-            handlePendingList();
+            drainPendingSafely();
+            lastPendingDrainTime = System.currentTimeMillis();
+
             while (running) {
                 try {
                     List<MapRecord<String, Object, Object>> orderList = stringRedisTemplate.opsForStream().read(
                             Consumer.from(STREAM_GROUP, STREAM_CONSUMER),
                             StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
                             StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed()));
+                    if (consecutiveFailures > 0) {
+                        log.info("Redis 消费恢复正常（此前连续失败 {} 次）", consecutiveFailures);
+                        consecutiveFailures = 0;
+                    }
                     if (orderList == null || orderList.isEmpty()) {
                         if (!running) {
                             break;
                         }
-                        // 无新消息时周期兜底处理pending，避免失败消息长期滞留
-                        if (System.currentTimeMillis() - lastPendingDrainTime > PENDING_DRAIN_INTERVAL) {
+                        // 固定节拍兜底清理 pending：每 30 秒一次，与这段时间有没有新消息无关
+                        if (System.currentTimeMillis() - lastPendingDrainTime >= PENDING_DRAIN_INTERVAL_MS) {
                             lastPendingDrainTime = System.currentTimeMillis();
-                            handlePendingList();
+                            drainPendingSafely();
                         }
                         continue;
                     }
@@ -220,11 +234,43 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                         log.info("秒杀消费者已停止，忽略关闭期间的一次读异常: {}", e.getMessage());
                         break;
                     }
-                    log.error("消费秒杀订单消息异常，转入pending重试", e);
-                    handlePendingList();
+                    backoffOnFailure(e);
                 }
             }
             log.info("秒杀消费者线程已退出");
+        }
+
+        /**
+         * 消费失败后的退避等待。
+         * <p>
+         * 原实现失败后立刻重试：Redis 长时间不可用时（虚拟机挂起、网络断开、连接被拒）
+         * {@code read} 是立即失败而不是阻塞 2 秒，外层循环会全速空转，
+         * 每轮还要进 pending 再刷 5 条 ERROR，几分钟就能把日志刷到几十 MB，CPU 也被打满。
+         * <p>
+         * 改为指数退避 1s→2s→4s→8s→16s→30s 封顶；连续失败只有第 1 次打完整堆栈，
+         * 之后只打一行摘要，日志量从"每次 6 条堆栈"降到"半分钟 1 行"。
+         */
+        private void backoffOnFailure(Exception e) {
+            consecutiveFailures++;
+            long backoff = Math.min(MAX_BACKOFF_MS, 1000L << Math.min(consecutiveFailures - 1, 5));
+            if (consecutiveFailures == 1) {
+                log.error("消费秒杀订单消息异常，{}ms 后重试", backoff, e);
+            } else {
+                log.warn("消费异常连续第 {} 次，{}ms 后重试：{}", consecutiveFailures, backoff, e.toString());
+            }
+            sleep(backoff);
+        }
+
+        /** pending 兜底清理统一入口：异常吞掉等下一轮，不在兜底流程里再抛 */
+        private void drainPendingSafely() {
+            try {
+                drainPendingList();
+            } catch (Exception e) {
+                if (running) {
+                    log.warn("pending 兜底清理中断，{} 秒后再试：{}",
+                            PENDING_DRAIN_INTERVAL_MS / 1000, e.toString());
+                }
+            }
         }
 
         private void processOrder(MapRecord<String, Object, Object> record) throws Exception {
@@ -257,34 +303,46 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
 
         /**
-         * 读取并处理当前消费者pending列表中的消息。
-         * 处理成功的消息会被ACK移出pending；真正处理不了的消息最多连续重试5次后暂停，避免死循环。
+         * 读取并处理当前消费者 pending 列表中的消息，单轮最多 {@link #PENDING_MAX_PER_ROUND} 条。
+         * <p>
+         * 刻意和主消费共用同一个线程，不另起定时线程：主线程正在处理、尚未 ACK 的消息
+         * 会被兜底线程再读一次，造成重复消费，只能靠数据库唯一索引兜底。单线程天然避免了这个问题。
+         * <p>
+         * 处理成功的消息 ACK 移出 pending；同一条连续失败 3 次则本轮放弃，等 30 秒后的下一轮，
+         * 避免一条处理不了的消息把消费线程长期占住。
+         * <p>
+         * 读 Redis 本身的异常不在这里吞，向上抛给 {@link #drainPendingSafely()}，由主循环的退避逻辑接管。
          */
-        private void handlePendingList() {
+        private void drainPendingList() {
+            int handled = 0;
             int failCount = 0;
-            while (running) {
+            while (running && handled < PENDING_MAX_PER_ROUND) {
+                List<MapRecord<String, Object, Object>> orderList = stringRedisTemplate.opsForStream().read(
+                        Consumer.from(STREAM_GROUP, STREAM_CONSUMER),
+                        StreamReadOptions.empty().count(1),
+                        StreamOffset.create(STREAM_KEY, ReadOffset.from("0")));
+                if (orderList == null || orderList.isEmpty()) {
+                    return;
+                }
                 try {
-                    List<MapRecord<String, Object, Object>> orderList = stringRedisTemplate.opsForStream().read(
-                            Consumer.from(STREAM_GROUP, STREAM_CONSUMER),
-                            StreamReadOptions.empty().count(1),
-                            StreamOffset.create(STREAM_KEY, ReadOffset.from("0")));
-                    if (orderList == null || orderList.isEmpty()) {
-                        break;
-                    }
                     processOrder(orderList.get(0));
+                    handled++;
                     failCount = 0;
                 } catch (Exception e) {
                     if (!running) {
                         log.info("秒杀消费者已停止，pending 处理提前结束，剩余消息留待下次启动重试");
-                        break;
+                        return;
                     }
-                    log.error("处理pending消息异常", e);
-                    if (++failCount >= 5) {
-                        log.error("pending消息连续失败{}次，暂停本次重试，等待下一轮", failCount);
-                        break;
+                    if (++failCount >= 3) {
+                        log.warn("pending 消息连续失败 {} 次，本轮放弃，{} 秒后重试：{}",
+                                failCount, PENDING_DRAIN_INTERVAL_MS / 1000, e.toString());
+                        return;
                     }
                     sleep(500);
                 }
+            }
+            if (handled >= PENDING_MAX_PER_ROUND) {
+                log.info("本轮 pending 已处理 {} 条，剩余的 {} 秒后继续", handled, PENDING_DRAIN_INTERVAL_MS / 1000);
             }
         }
     }
